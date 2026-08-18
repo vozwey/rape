@@ -1,4 +1,4 @@
-# RAPE - Rusty AgentRouter Proxy Extreme
+# RAPE - Rusty AgentRouter Proxy Ehehehehehehehe
 
 A small transparent HTTP proxy for using AgentRouter through a local OpenAI-compatible endpoint.
 
@@ -12,7 +12,7 @@ RAPE never reads or stores API keys. Configure the client using its normal reque
 nix run .
 ```
 
-Pass a port as the first argument to override the default:
+Pass a port as the first argument to override the default (default is 7187):
 
 ```sh
 nix run . -- 8080
@@ -32,10 +32,3 @@ Import `homeManagerModules.rape` and enable the service:
 ```
 
 The module runs RAPE as a user `systemd` service and starts it at login.
-
-## Development
-
-```sh
-nix develop
-cargo test
-```
