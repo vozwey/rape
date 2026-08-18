@@ -26,7 +26,7 @@ nix run . -- 8080
 
 ## Home Manager
 
-Import `homeManagerModules.rape` and enable the service:
+Import `homeModules.rape` and enable the service:
 
 ```nix
 {

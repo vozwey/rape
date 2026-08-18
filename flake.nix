@@ -22,7 +22,7 @@
         default = pkgs.mkShell { packages = with pkgs; [ cargo rustc ]; };
       });
 
-      homeManagerModules.default = { config, lib, pkgs, ... }:
+      homeModules.default = { config, lib, pkgs, ... }:
         let cfg = config.services.rape;
         in
         {
@@ -50,6 +50,6 @@
           };
         };
 
-      homeManagerModules.rape = self.homeManagerModules.default;
+      homeModules.rape = self.homeModules.default;
     };
 }
