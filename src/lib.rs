@@ -37,14 +37,17 @@ async fn proxy(
 
     builder = builder.header(axum::http::header::USER_AGENT, ALLOWED_CLIENT_USER_AGENT);
 
-    let upstream = match builder
-        .body(reqwest::Body::wrap_stream(
-            body.into_data_stream()
-                .map(|chunk| chunk.map_err(std::io::Error::other)),
-        ))
-        .send()
-        .await
-    {
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let mut response = Response::new(Body::from(error.to_string()));
+            *response.status_mut() = axum::http::StatusCode::BAD_REQUEST;
+            return response;
+        }
+    };
+    let body_bytes = sanitize_tool_schemas(&body_bytes);
+
+    let upstream = match builder.body(body_bytes).send().await {
         Ok(response) => response,
         Err(error) => {
             let mut response = Response::new(Body::from(error.to_string()));
@@ -82,6 +85,55 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
+/// Strict upstreams (e.g. DeepSeek) reject schemas where dirge serializes
+/// omitted tool parameters as `"required": null`. Coerce those to empty
+/// arrays/objects inside tool definitions only, leaving messages untouched.
+fn sanitize_tool_schemas(body: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    let mut changed = false;
+    if let Some(object) = value.as_object_mut() {
+        for key in ["tools", "functions"] {
+            if let Some(items) = object
+                .get_mut(key)
+                .and_then(|section| section.as_array_mut())
+            {
+                for item in items {
+                    changed |= sanitize_schema(item);
+                }
+            }
+        }
+    }
+    if changed {
+        serde_json::to_vec(&value).expect("Value round-trips through JSON")
+    } else {
+        body.to_vec()
+    }
+}
+
+fn sanitize_schema(schema: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    if let Some(object) = schema.as_object_mut() {
+        if object.get("required") == Some(&serde_json::Value::Null) {
+            object.insert("required".to_owned(), serde_json::json!([]));
+            changed = true;
+        }
+        if object.get("properties") == Some(&serde_json::Value::Null) {
+            object.insert("properties".to_owned(), serde_json::json!({}));
+            changed = true;
+        }
+        for child in object.values_mut() {
+            changed |= sanitize_schema(child);
+        }
+    } else if let Some(array) = schema.as_array_mut() {
+        for child in array {
+            changed |= sanitize_schema(child);
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -95,10 +147,14 @@ mod tests {
 
     async fn spawn_upstream() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr) {
         let upstream = Router::new().fallback(|request: Request| async move {
-            let (parts, _body) = request.into_parts();
+            let (parts, body) = request.into_parts();
+            let received_body =
+                String::from_utf8_lossy(&axum::body::to_bytes(body, usize::MAX).await.unwrap())
+                    .into_owned();
             let mut resp_headers = vec![
                 ("x-upstream".to_owned(), "present".to_owned()),
                 ("content-type".to_owned(), "text/event-stream".to_owned()),
+                ("x-received-body".to_owned(), received_body),
             ];
             for (k, v) in &parts.headers {
                 if k.as_str().starts_with("x-stainless") {
@@ -130,6 +186,97 @@ mod tests {
                 .unwrap();
         });
         (handle, addr)
+    }
+
+    #[tokio::test]
+    async fn proxy_sanitizes_null_required_and_properties_in_tool_schemas() {
+        let (_upstream_handle, upstream_addr) = spawn_upstream().await;
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let app = crate::app(Client::new(), format!("http://{upstream_addr}"));
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let body = r#"{"model":"deepseek-chat","messages":[{"role":"user","content":"keep literal \"required\": null"}],"tools":[{"type":"function","function":{"name":"list_symbols","parameters":{"type":"object","properties":{},"required":null}}},{"type":"function","function":{"name":"make_chart","parameters":{"type":"object","properties":{"chart":{"type":"object","properties":null,"required":null}},"required":null}}}],"functions":[{"name":"legacy_fn","parameters":{"type":"object","properties":null,"required":null}}]}"#;
+
+        let response = Client::new()
+            .post(format!("http://{proxy_addr}/v1/chat/completions"))
+            .header(header::AUTHORIZATION, "Bearer test-key")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let forwarded: serde_json::Value =
+            serde_json::from_str(response.headers()["x-received-body"].to_str().unwrap()).unwrap();
+        assert_eq!(
+            forwarded["tools"][0]["function"]["parameters"]["required"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            forwarded["tools"][1]["function"]["parameters"]["required"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            forwarded["tools"][1]["function"]["parameters"]["properties"]["chart"]["required"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            forwarded["tools"][1]["function"]["parameters"]["properties"]["chart"]["properties"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            forwarded["functions"][0]["parameters"]["required"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            forwarded["messages"][0]["content"],
+            "keep literal \"required\": null"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_bodies_without_schema_nulls_byte_for_byte() {
+        let (_upstream_handle, upstream_addr) = spawn_upstream().await;
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let app = crate::app(Client::new(), format!("http://{upstream_addr}"));
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let client = Client::new();
+        let url = format!("http://{proxy_addr}/v1/chat/completions");
+
+        let non_json = "request body";
+        let response = client
+            .post(&url)
+            .header(header::AUTHORIZATION, "Bearer test-key")
+            .body(non_json)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-received-body"], non_json);
+
+        let valid_tools = r#"{"model":"gpt-4","tools":[{"type":"function","function":{"name":"ok_fn","parameters":{"type":"object","properties":{},"required":["a"]}}}]}"#;
+        let response = client
+            .post(&url)
+            .header(header::AUTHORIZATION, "Bearer test-key")
+            .body(valid_tools)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-received-body"], valid_tools);
     }
 
     #[tokio::test]
@@ -285,7 +432,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(!response.headers().contains_key("x-received-content-length"));
+        // The caller's content-length is stripped; reqwest recomputes it from
+        // the buffered body ("request body" is non-JSON and forwarded as-is).
+        assert_eq!(response.headers()["x-received-content-length"], "12");
         assert!(!response.headers().contains_key("x-received-connection"));
         assert!(!response.headers().contains_key("x-received-te"));
     }
