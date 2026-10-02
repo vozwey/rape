@@ -6,7 +6,11 @@ A small HTTP proxy for using AgentRouter through a local OpenAI-compatible endpo
 
 RAPE listens on `127.0.0.1:7187` by default and forwards requests to `https://agentrouter.org`. It passes through request methods, paths, bodies, and most headers, including the incoming `Authorization` header.
 
-RAPE slightly modifies outgoing requests before forwarding them to AgentRouter. In particular, it replaces the client's `User-Agent` with `opencode/0.11.0`, making AgentRouter treat the request as if it came from OpenCode. Hop-by-hop headers and `Content-Length` are also handled by the proxy as required for forwarding.
+RAPE slightly modifies outgoing requests before forwarding them to AgentRouter. It replaces the client's `User-Agent` with `opencode/0.11.0` and normalizes missing or null `required`/`properties` fields in tool schemas. Literal schema values and message contents are left alone. Hop-by-hop headers and `Content-Length` are handled as required for forwarding.
+
+For Messages and Chat Completions, RAPE requests uncompressed responses and keeps a bounded, in-memory cache of original thinking/reasoning, including signatures. It restores blocks omitted by clients when the credentials, model, conversation history, and assistant message match. Responses still stream unchanged. The cache holds up to 256 messages and 64 MiB of serialized data, with an 8 MiB capture limit per response; it is lost on restart.
+
+If AgentRouter explicitly rejects a request because thinking was not passed back and the cache cannot repair it, RAPE retries once with thinking disabled. It does not fabricate thinking or signatures, and unrelated errors are returned unchanged.
 
 Upstream response status, headers, errors, and streaming/SSE bodies are returned to the local client.
 
